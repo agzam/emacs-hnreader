@@ -5,7 +5,7 @@
 ;; Author: Thanh Vuong <thanhvg@gmail.com>
 ;; URL: https://github.com/thanhvg/emacs-hnreader/
 ;; Package-Requires: ((emacs "25.1") (promise "1.1") (request "0.3.0") (org "9.2"))
-;; Version: 0.2.8
+;; Version: 0.2.9
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -46,6 +46,9 @@
 ;; when viewing comments
 
 ;;; Changelog
+;; 0.2.9 2026-08-14 Render pages without a byline, supersede an in-flight
+;;                  fetch instead of racing it, optionally fetch through a
+;;                  logged-in browser tab, report load failures
 ;; 0.2.8 2025-07-02 Show title in all pages
 ;; 0.2.7 2025-07-01 update title capture for page and item
 ;; 0.2.6 2024-11-09 update css class capture
@@ -79,6 +82,32 @@
 (defcustom hnreader-view-comments-in-same-window t
   "Max history to remember."
   :type 'boolean
+  :group 'hnreader)
+
+(defcustom hnreader-user-agent
+  (format "hnreader/%s (Emacs %s; +https://github.com/thanhvg/emacs-hnreader)"
+          "0.2.9" emacs-version)
+  "What to identify as when fetching a page.
+Hacker News hands out a much smaller request budget to the User-Agent
+curl sends by default, so leaving this unset costs pages."
+  :type '(choice (const :tag "Whatever curl sends" nil) string)
+  :group 'hnreader)
+
+(defcustom hnreader-fetch-function #'hnreader--fetch-via-request
+  "How a page is retrieved.
+`hnreader--fetch-via-request' fetches directly.  Hacker News gives an
+anonymous client a small request budget and answers HTTP 429 once it is
+spent, so reading more than a few items in a sitting fails.
+`hnreader--fetch-via-browser' runs the request inside a running browser
+tab instead, carrying that browser's logged-in session."
+  :type '(choice (const :tag "Directly" hnreader--fetch-via-request)
+                 (const :tag "Through a browser tab" hnreader--fetch-via-browser)
+                 function)
+  :group 'hnreader)
+
+(defcustom hnreader-browser-name "Brave Browser"
+  "MacOS browser application used by `hnreader--fetch-via-browser'."
+  :type 'string
   :group 'hnreader)
 
 ;; internal stuff
@@ -130,20 +159,124 @@ third one is 80.")
   "Get hn commnet buffer."
   (get-buffer-create hnreader--comment-buffer))
 
-(defun hnreader--promise-dom (url)
-  "Promise (url . dom) from URL with curl."
+(defvar hnreader--request nil
+  "The fetch in flight, if any.")
+
+(defun hnreader--parse-html ()
+  "Parse the current buffer as a Hacker News page."
+  (goto-char (point-min))
+  (while (re-search-forward ">\\*" nil t)
+    (replace-match ">-"))
+  (libxml-parse-html-region (point-min) (point-max)))
+
+(defun hnreader--fetch-via-request (url)
+  "Promise the dom of URL, fetched directly."
+  ;; Hacker News answers concurrent requests with HTTP 429 and keeps
+  ;; throttling for a while after, and every page lands in the same buffer,
+  ;; so an earlier fetch is only ever in the way of a later one.
+  (when hnreader--request
+    (request-abort hnreader--request))
   (promise-new
    (lambda (resolve reject)
-     (request url
-       :parser (lambda ()
-                 (goto-char (point-min))
-                 (while (re-search-forward ">\\*" nil t)
-                   (replace-match ">-"))
-                 (libxml-parse-html-region (point-min) (point-max)))
-       :error (cl-function (lambda (&rest args &key error-thrown &allow-other-keys)
-                             (funcall reject  error-thrown)))
-       :success (cl-function (lambda (&key data &allow-other-keys)
-                               (funcall resolve data)))))))
+     (setq hnreader--request
+           (request url
+             :headers (when hnreader-user-agent
+                        `(("User-Agent" . ,hnreader-user-agent)))
+             :parser #'hnreader--parse-html
+             :error (cl-function (lambda (&rest args &key error-thrown symbol-status &allow-other-keys)
+                                   ;; a superseded fetch is not a failure to report
+                                   (unless (eq symbol-status 'abort)
+                                     (funcall reject error-thrown))))
+             :success (cl-function (lambda (&key data &allow-other-keys)
+                                     (funcall resolve data))))))))
+
+(defconst hnreader--browser-fetch-jxa
+  "function run(argv) {
+  var url = argv[0];
+  var appName = argv[1];
+  var app = Application(appName);
+  var origin = 'https://news.ycombinator.com';
+  var wins = app.windows();
+  if (wins.length === 0) { throw new Error('no ' + appName + ' windows open'); }
+  var tab = null, win = null, created = false;
+  for (var i = 0; i < wins.length && !tab; i++) {
+    var tabs = wins[i].tabs();
+    for (var j = 0; j < tabs.length; j++) {
+      var u = tabs[j].url();
+      if (u && u.lastIndexOf(origin, 0) === 0) { tab = tabs[j]; win = wins[i]; break; }
+    }
+  }
+  if (!tab) {
+    win = wins[0];
+    win.tabs.push(app.Tab({url: origin + '/robots.txt'}));
+    created = true;
+    var ts = win.tabs();
+    tab = ts[ts.length - 1];
+    for (var k = 0; k < 100; k++) {
+      delay(0.1);
+      try { if (tab.loading() === false) { break; } } catch (e) { break; }
+    }
+  }
+  var js = \"(function(){try{var x=new XMLHttpRequest();x.open('GET',\" + JSON.stringify(url) + \",false);x.send(null);return 'HTTP '+x.status+String.fromCharCode(10)+x.responseText}catch(e){return 'HTTP 0'+String.fromCharCode(10)+String(e)}})()\";
+  try {
+    return tab.execute({javascript: js});
+  } finally {
+    if (created) { tab.close(); }
+  }
+}"
+  "JXA program running a same-origin Hacker News request inside the browser.
+Takes URL and browser name.  Reuses an existing news.ycombinator.com tab
+when present, otherwise opens a throwaway one and closes it after.
+Prints \"HTTP <status>\" on the first line and the page after it.")
+
+(defun hnreader--browser-fetch-command (url)
+  "Build the osascript command list requesting URL via the browser."
+  (list "osascript" "-l" "JavaScript" "-e" hnreader--browser-fetch-jxa
+        (url-encode-url url)
+        hnreader-browser-name))
+
+(defun hnreader--fetch-via-browser (url)
+  "Promise the dom of URL, fetched inside a running browser tab.
+The request carries the browser's Hacker News session, which is given a
+far larger request budget than an anonymous one; anonymous fetches draw
+HTTP 429 after a handful of pages."
+  (promise-new
+   (lambda (resolve reject)
+     (let ((stdout (generate-new-buffer " *hnreader-browser-fetch*"))
+           (stderr (generate-new-buffer " *hnreader-browser-fetch-err*")))
+       (make-process
+        :name "hnreader-browser-fetch"
+        :buffer stdout
+        :stderr stderr
+        :noquery t
+        :command (hnreader--browser-fetch-command url)
+        :sentinel
+        (lambda (proc _event)
+          (when (memq (process-status proc) '(exit signal))
+            (unwind-protect
+                (if (/= (process-exit-status proc) 0)
+                    (funcall reject
+                             (format "browser fetch failed: %s"
+                                     (string-trim
+                                      (with-current-buffer stderr (buffer-string)))))
+                  (with-current-buffer stdout
+                    (goto-char (point-min))
+                    (let ((status (buffer-substring-no-properties
+                                   (point-min) (line-end-position))))
+                      (if (not (string= status "HTTP 200"))
+                          (funcall reject (list 'error 'http
+                                                (string-to-number
+                                                 (or (cadr (split-string status)) "0"))))
+                        (delete-region (point-min) (min (1+ (line-end-position)) (point-max)))
+                        (funcall resolve (hnreader--parse-html))))))
+              (when-let* ((p (get-buffer-process stderr)))
+                (delete-process p))
+              (kill-buffer stdout)
+              (kill-buffer stderr)))))))))
+
+(defun hnreader--promise-dom (url)
+  "Promise the dom of URL via `hnreader-fetch-function'."
+  (funcall hnreader-fetch-function url))
 
 (defun hnreader--prepare-buffer (buf &optional msg)
   "Print MSG message and prepare window for BUF buffer."
@@ -266,7 +399,11 @@ third one is 80.")
       (let ((title (dom-text (dom-by-tag dom 'title)))
             (id (dom-attr (car (dom-by-class dom "athing")) 'id)))
         (if title
-            (cons title (format "https://news.ycombinator.com/item?id=%s" id))
+            (cons title
+                  ;; a user profile and other pages that list no item have
+                  ;; nothing to link to
+                  (when id
+                    (format "https://news.ycombinator.com/item?id=%s" id)))
           nil))))
 
 (defun hnreader--get-post-info (dom)
@@ -307,6 +444,30 @@ third one is 80.")
         (shr-use-fonts nil))
     (shr-insert-document node)))
 
+(defun hnreader--explain-reason (reason)
+  "Say what REASON means, falling back to printing it as it came."
+  (pcase reason
+    (`(error http 429)
+     "Hacker News is rate limiting this address (HTTP 429).
+The limit is per address and covers every client on it, so a browser
+on the same machine can still work. It lifts on its own; retry in a
+few minutes.")
+    (_ (format "%s" reason))))
+
+(defun hnreader--print-error (buf url reason retry)
+  "Report REASON for a failed load of URL in BUF, offering RETRY as a link.
+The buffer otherwise sits on the \"Loading...\" placeholder forever,
+so a rate limit or a malformed url looks like nothing happened."
+  (with-current-buffer buf
+    (read-only-mode -1)
+    (erase-buffer)
+    (insert "#+STARTUP: overview indent\n")
+    (insert "#+TITLE: Hacker News\n\n")
+    (insert (format "Could not load %s\n\n%s\n\n" url (hnreader--explain-reason reason)))
+    (insert (format "[[elisp:(%s \"%s\")][Retry]]" retry url))
+    (hnreader-mode)
+    (goto-char (point-min))))
+
 (defun hnreader--print-comments (dom url)
   "Print DOM comment and URL to buffer."
   (let ((comments (dom-by-class dom "^athing comtr$"))
@@ -317,9 +478,13 @@ third one is 80.")
       (read-only-mode -1)
       (erase-buffer)
       (insert "#+STARTUP: overview indent\n")
-      (insert "#+TITLE: " (car title))
-      (insert (format "\n%s\n[[eww:%s][view story in eww]]\n" (cdr title) (cdr title)))
-      (insert (car info))
+      ;; both getters below are documented to return nil, and `insert'
+      ;; signals on nil rather than skipping it
+      (insert "#+TITLE: " (or (car title) "Hacker News") "\n")
+      (when (cdr title)
+        (insert (format "%s\n[[eww:%s][view story in eww]]\n" (cdr title) (cdr title))))
+      (when (car info)
+        (insert (car info)))
       (when (cdr info)
         (insert "\n")
         (hnreader--print-node (cdr info)))
@@ -385,7 +550,8 @@ a, img or pre. Otherwise copy"
     (then (lambda (result)
             (hnreader--print-frontpage result (hnreader--get-hn-buffer) url)))
     (promise-catch (lambda (reason)
-                     (message "catch error in promise prontpage: %s" reason)))))
+                     (hnreader--print-error (hnreader--get-hn-buffer)
+                                            url reason 'hnreader-read-page-back)))))
 
 (defun hnreader-read-page-back (url)
   "Print HN URL page and won't change the history."
@@ -458,7 +624,8 @@ Also upate `hnreader--history'."
     (then (lambda (dom)
             (hnreader--print-comments dom url)))
     (promise-catch (lambda (reason)
-                     (message "catch error in promise comments: %s" reason)))))
+                     (hnreader--print-error (hnreader--get-hn-comment-buffer)
+                                            url reason 'hnreader-comment)))))
 
 ;;;###autoload
 (defun hnreader-comment (url)
